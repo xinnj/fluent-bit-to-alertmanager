@@ -10,9 +10,14 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
+	"os"
+	"time"
 )
 
 type LogEntry map[string]any
+
+var alertManagerHost, alertManagerBasePath, alertManagerScheme string
 
 func parseLogs(r *http.Request) ([]LogEntry, error) {
 	body, err := io.ReadAll(r.Body)
@@ -37,7 +42,7 @@ func parseLogs(r *http.Request) ([]LogEntry, error) {
 func createAlertFromLog(oneLog LogEntry) models.PostableAlerts {
 	logTime, err := strfmt.ParseDateTime(oneLog["time"].(string))
 	if err != nil {
-		logTime = strfmt.NewDateTime()
+		logTime = strfmt.DateTime(time.Now())
 	}
 	postableAlert := models.PostableAlert{
 		StartsAt: logTime,
@@ -62,10 +67,7 @@ func createAlertFromLog(oneLog LogEntry) models.PostableAlerts {
 }
 
 func sendAlerts(alerts models.PostableAlerts) error {
-	// alertManagerHost := "prometheus-kube-prometheus-alertmanager.monitoring:9093"
-	alertManagerHost := "localhost:9698"
-	alertManagerBasePath := "/alertmanager/api/v2/"
-	cr := clientruntime.New(alertManagerHost, alertManagerBasePath, []string{"http"})
+	cr := clientruntime.New(alertManagerHost, alertManagerBasePath, []string{alertManagerScheme})
 	alertManagerClient := alert.New(cr, strfmt.Default)
 
 	response, err := alertManagerClient.PostAlerts(alert.NewPostAlertsParams().WithAlerts(alerts))
@@ -101,10 +103,24 @@ func receiveLog(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func parseAlertManagerURL() {
+	alertManagerURL := os.Getenv("ALERTMANAGER_URL")
+	u, err := url.Parse(alertManagerURL)
+	if err != nil {
+		log.Fatal("Can't parse ALERTMANAGER_URL: ", err)
+	}
+
+	alertManagerHost = u.Host
+	alertManagerBasePath = u.Path
+	alertManagerScheme = u.Scheme
+}
+
 func sentTestAlert() {
-	var oneLog LogEntry
-	oneLog = LogEntry{
-		"time": strfmt.NewDateTime(),
+	os.Setenv("ALERTMANAGER_URL", "http://localhost:9698/alertmanager/api/v2/")
+	parseAlertManagerURL()
+
+	oneLog := LogEntry{
+		"time": strfmt.DateTime(time.Now()).String(),
 		"log":  "test",
 		"kubernetes": map[string]any{
 			"namespace_name": "test-namespace",
@@ -112,12 +128,16 @@ func sentTestAlert() {
 		},
 	}
 	alerts := createAlertFromLog(oneLog)
-	sendAlerts(alerts)
+	err := sendAlerts(alerts)
+	if err != nil {
+		log.Fatal("ListenAndServe: ", err)
+	}
 }
 
 func main() {
-	// sentTestAlert()
+	//sentTestAlert()
 
+	parseAlertManagerURL()
 	http.HandleFunc("/", receiveLog)
 	err := http.ListenAndServe(":8080", nil)
 	if err != nil {
