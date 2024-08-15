@@ -102,4 +102,4 @@ env:
   - name: 'TZ'
     value: 'Asia/Shanghai'
   - name: 'ALERTMANAGER_URL'
-    value: 'http://prometheus-kube-prometheus-alertmanager:9093/alertmanager/api/v2/'
+    value: 'http://prometheus-kube-prometheus-alertmanager.monitoring:9093/alertmanager/api/v2/'

@@ -103,6 +103,10 @@ func receiveLog(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func healthCheck(w http.ResponseWriter, r *http.Request) {
+	w.WriteHeader(http.StatusOK)
+}
+
 func parseAlertManagerURL() {
 	alertManagerURL := os.Getenv("ALERTMANAGER_URL")
 	u, err := url.Parse(alertManagerURL)
@@ -139,8 +143,11 @@ func main() {
 
 	parseAlertManagerURL()
 	http.HandleFunc("/", receiveLog)
+	http.HandleFunc("/health", healthCheck)
 	err := http.ListenAndServe(":8080", nil)
 	if err != nil {
 		log.Fatal("ListenAndServe: ", err)
+	} else {
+		log.Print("Listening on port 8080")
 	}
 }
