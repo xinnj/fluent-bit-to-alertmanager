@@ -3,47 +3,75 @@ package main
 import (
 	"encoding/json"
 	"fmt"
-	clientruntime "github.com/go-openapi/runtime/client"
-	"github.com/go-openapi/strfmt"
-	"github.com/prometheus/alertmanager/api/v2/client/alert"
-	"github.com/prometheus/alertmanager/api/v2/models"
 	"io"
 	"log"
 	"net/http"
 	"net/url"
 	"os"
 	"time"
+
+	clientruntime "github.com/go-openapi/runtime/client"
+	"github.com/go-openapi/strfmt"
+	"github.com/prometheus/alertmanager/api/v2/client/alert"
+	"github.com/prometheus/alertmanager/api/v2/models"
 )
 
 type LogEntry map[string]any
 
 var alertManagerHost, alertManagerBasePath, alertManagerScheme string
+var alertManagerClient alert.ClientService
+
+func initLogging() {
+	// 将日志输出到 stdout，设置可读的时间/文件信息
+	log.SetOutput(os.Stdout)
+	log.SetFlags(log.LstdFlags | log.Lmicroseconds | log.Lshortfile)
+}
+
+func initAlertManagerClient() {
+	cr := clientruntime.New(alertManagerHost, alertManagerBasePath, []string{alertManagerScheme})
+	alertManagerClient = alert.New(cr, strfmt.Default)
+}
 
 func parseLogs(r *http.Request) ([]LogEntry, error) {
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
-		return nil, fmt.Errorf("Error reading body: %v", err)
+		return nil, fmt.Errorf("error reading body: %v", err)
 	}
-	defer func(Body io.ReadCloser) {
-		err := Body.Close()
-		if err != nil {
+	defer func() {
+		if err := r.Body.Close(); err != nil {
+			log.Printf("Warning: failed to close request body: %v", err)
 		}
-	}(r.Body)
+	}()
 
 	var logs []LogEntry
 	err = json.Unmarshal(body, &logs)
 	if err != nil {
-		return nil, fmt.Errorf("Error unmarshalling logs: %v", err)
+		return nil, fmt.Errorf("error unmarshalling logs: %v", err)
 	}
 
 	return logs, nil
 }
 
 func createAlertFromLog(oneLog LogEntry) models.PostableAlerts {
-	logTime, err := strfmt.ParseDateTime(oneLog["time"].(string))
-	if err != nil {
-		logTime = strfmt.DateTime(time.Now())
+	getString := func(key string) string {
+		if val, ok := oneLog[key].(string); ok {
+			return val
+		}
+		return ""
 	}
+
+	var logTime strfmt.DateTime
+	timeStr := getString("time")
+	if timeStr == "" {
+		logTime = strfmt.DateTime(time.Now())
+	} else {
+		var err error
+		logTime, err = strfmt.ParseDateTime(timeStr)
+		if err != nil {
+			logTime = strfmt.DateTime(time.Now())
+		}
+	}
+
 	postableAlert := models.PostableAlert{
 		StartsAt: logTime,
 		Annotations: map[string]string{
@@ -54,29 +82,28 @@ func createAlertFromLog(oneLog LogEntry) models.PostableAlerts {
 			Labels: map[string]string{
 				"severity":  "warning",
 				"alertname": "ErrorLog",
-				"time":      oneLog["time"].(string),
-				"log":       oneLog["log"].(string),
-				"namespace": oneLog["kubernetes"].(map[string]interface{})["namespace_name"].(string),
-				"pod":       oneLog["kubernetes"].(map[string]interface{})["pod_name"].(string),
+				"time":      logTime.String(),
+				"log":       getString("log"),
+				"namespace": getString("namespace"),
+				"app":       getString("app"),
 			},
 		},
 	}
-	alerts := append(models.PostableAlerts{}, &postableAlert)
+	alerts := models.PostableAlerts{&postableAlert}
 
 	return alerts
 }
 
 func sendAlerts(alerts models.PostableAlerts) error {
-	cr := clientruntime.New(alertManagerHost, alertManagerBasePath, []string{alertManagerScheme})
-	alertManagerClient := alert.New(cr, strfmt.Default)
-
 	response, err := alertManagerClient.PostAlerts(alert.NewPostAlertsParams().WithAlerts(alerts))
 	if err != nil {
-		return fmt.Errorf("Error posting alerts: %v", err)
+		return fmt.Errorf("error posting alerts: %v", err)
 	}
 
 	if response != nil && response.IsSuccess() {
 		log.Printf("Alerts posted successfully.")
+	} else {
+		log.Printf("PostAlerts response: %#v", response)
 	}
 
 	return nil
@@ -103,51 +130,53 @@ func receiveLog(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func healthCheck(w http.ResponseWriter, r *http.Request) {
+func healthCheck(w http.ResponseWriter, _ *http.Request) {
 	w.WriteHeader(http.StatusOK)
 }
 
 func parseAlertManagerURL() {
 	alertManagerURL := os.Getenv("ALERTMANAGER_URL")
+	if alertManagerURL == "" {
+		defaultURL := "http://localhost:9093"
+		log.Printf("ALERTMANAGER_URL not set, using default %s", defaultURL)
+		alertManagerURL = defaultURL
+	}
+
 	u, err := url.Parse(alertManagerURL)
 	if err != nil {
-		log.Fatal("Can't parse ALERTMANAGER_URL: ", err)
+		log.Fatalf("Can't parse ALERTMANAGER_URL '%s': %v", alertManagerURL, err)
+	}
+
+	if u.Host == "" {
+		log.Printf("Parsed ALERTMANAGER_URL has empty host, using default host 'localhost:9093'")
+		u = &url.URL{Scheme: "http", Host: "localhost:9093", Path: ""}
 	}
 
 	alertManagerHost = u.Host
 	alertManagerBasePath = u.Path
 	alertManagerScheme = u.Scheme
+
+	log.Printf("Alertmanager configured -> scheme: %s host: %s basePath: %s", alertManagerScheme, alertManagerHost, alertManagerBasePath)
 }
 
-func sentTestAlert() {
-	os.Setenv("ALERTMANAGER_URL", "http://localhost:9698/alertmanager/api/v2/")
-	parseAlertManagerURL()
-
-	oneLog := LogEntry{
-		"time": strfmt.DateTime(time.Now()).String(),
-		"log":  "test",
-		"kubernetes": map[string]any{
-			"namespace_name": "test-namespace",
-			"pod_name":       "test-pod",
-		},
-	}
-	alerts := createAlertFromLog(oneLog)
-	err := sendAlerts(alerts)
-	if err != nil {
-		log.Fatal("ListenAndServe: ", err)
+func logRequest(h http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		log.Printf("REQ %s - %s %s", r.RemoteAddr, r.Method, r.URL.RequestURI())
+		h(w, r)
 	}
 }
 
 func main() {
-	//sentTestAlert()
-
+	initLogging()
 	parseAlertManagerURL()
-	http.HandleFunc("/", receiveLog)
+	initAlertManagerClient()
+
+	http.HandleFunc("/", logRequest(receiveLog))
 	http.HandleFunc("/health", healthCheck)
+
+	log.Print("Listening on port 8080")
 	err := http.ListenAndServe(":8080", nil)
 	if err != nil {
 		log.Fatal("ListenAndServe: ", err)
-	} else {
-		log.Print("Listening on port 8080")
 	}
 }
